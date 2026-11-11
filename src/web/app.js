@@ -29,7 +29,7 @@ window.kdc = {
   },
   event(kind, p) {
     if (kind === "toast") toast(p.text, p.kind);
-    else if (kind === "message") onMessage(p);
+    else if (kind === "messages") onMessages(p);
     else if (kind === "contacts" && p.device === U.dev && U.view === "messages") loadConversations(false);
   },
 };
@@ -163,6 +163,7 @@ const pluginName = (pid) => (S.plugins[pid] || [pid.replace("kdeconnect_", "")])
 const devIcon = (t) => ({ phone: "phone", smartphone: "phone", tablet: "tablet", desktop: "desktop", laptop: "laptop", tv: "tv" })[t] || "phone";
 
 function go(view, extra = {}) {
+  if (document.pointerLockElement) document.exitPointerLock();
   if (view !== U.view) U.back = U.view === "config" || U.view === "commands" ? "plugins" : U.view;
   Object.assign(U, { view, unpairArm: false }, extra);
   if (view === "messages") loadConversations(true);
@@ -242,17 +243,27 @@ function renderMain() {
   const key = `${view}|${U.dev}|${U.cfg}`;
   const v = VIEWS[view];
   main.className = view === "messages" ? "flush" : "";
-  if (v.shell) {
-    if (main._key !== key) {
-      main.innerHTML = v.shell(d);
-      main._html = null;
+  // A bug in one view must not leave the window frozen on its last frame:
+  // show what failed so it can be reported, and keep the rest working.
+  try {
+    if (v.shell) {
+      if (main._key !== key) {
+        main.innerHTML = v.shell(d);
+        main._html = null;
+        main._key = key;
+        v.mount?.(d);
+      }
+      v.update(d);
+    } else {
       main._key = key;
-      v.mount?.(d);
+      patch(main, v.html(d));
     }
-    v.update(d);
-  } else {
-    main._key = key;
-    patch(main, v.html(d));
+  } catch (err) {
+    console.error(err);
+    main._key = null;
+    patch(main, `<div class="center"><section class="panel"><h1 class="small">This page failed to draw</h1>
+      <p class="selectable mono">${esc(err && err.stack ? err.stack : err)}</p>
+      <button class="btn" data-act="go" data-view="overview">Back to overview</button></section></div>`);
   }
 }
 
@@ -552,30 +563,45 @@ function commandDialog(index) {
 
 const OUTGOING = new Set([2, 4, 5, 6]);
 
+// One fetch in flight at a time; a reply for a device that is no longer
+// selected is dropped. A failed fetch keeps whatever list was already shown.
+let convFetch = null;
 async function loadConversations(request = false) {
   const d = cur();
   if (!d) return;
-  try {
-    U.convs = await call("conversations", { device: d.id, request });
-  } catch (err) {
-    U.convs = U.convs || [];
-    toast(err.message, "error");
-  }
-  if (U.view === "messages") render();
+  if (convFetch && convFetch.device === d.id && !request) return convFetch.promise;
+  const job = { device: d.id };
+  job.promise = (async () => {
+    U.convsError = null;
+    try {
+      const list = await call("conversations", { device: d.id, request });
+      if (U.dev === job.device) U.convs = list;
+    } catch (err) {
+      if (U.dev === job.device) U.convsError = err.message;
+    } finally {
+      if (convFetch === job) convFetch = null;
+    }
+    if (U.view === "messages") render();
+  })();
+  convFetch = job;
+  return job.promise;
 }
 
 let convTimer = 0;
-function onMessage({ device, message }) {
+function onMessages({ device, messages }) {
   if (device !== U.dev) return;
-  const t = (U.msgs[message.thread] ||= {});
-  t[message.uid] = message;
-  const box = U.outbox[message.thread];
-  if (box && OUTGOING.has(message.type)) {
-    const i = box.indexOf(message.body);
-    if (i >= 0) box.splice(i, 1);
+  for (const message of messages) {
+    const t = (U.msgs[message.thread] ||= {});
+    t[message.uid] = message;
+    const box = U.outbox[message.thread];
+    if (box && OUTGOING.has(message.type)) {
+      const i = box.indexOf(message.body);
+      if (i >= 0) box.splice(i, 1);
+    }
   }
+  // Refresh the thread list once things settle, not per batch.
   clearTimeout(convTimer);
-  convTimer = setTimeout(() => loadConversations(false), 400);
+  convTimer = setTimeout(() => U.view === "messages" && loadConversations(false), 1500);
   if (U.view === "messages") render();
 }
 
@@ -606,12 +632,19 @@ VIEWS.messages = {
     const q = U.mq.trim().toLowerCase();
     const convs = U.convs;
     let list;
-    if (!convs) list = '<p class="empty" style="padding:0 8px">Loading conversations…</p>';
+    if (!convs && U.convsError)
+      list = `<p class="empty" style="padding:0 8px">Couldn't load conversations: ${esc(U.convsError)}</p><button class="btn ghost" data-act="retryConvs">Try again</button>`;
+    else if (!convs) list = '<p class="empty" style="padding:0 8px">Loading conversations…</p>';
     else {
-      list = convs
-        .filter((c) => !q || `${c.name} ${c.addresses.join(" ")} ${c.body}`.toLowerCase().includes(q))
+      // Phones can have thousands of threads; draw the newest few hundred and
+      // let search reach the rest.
+      const LIMIT = 300;
+      const matches = convs.filter((c) => !q || `${c.name} ${c.addresses.join(" ")} ${c.body}`.toLowerCase().includes(q));
+      list = matches
+        .slice(0, LIMIT)
         .map((c) => {
-          const letter = /[a-z]/i.test(c.name[0]) ? c.name[0].toUpperCase() : "#";
+          const first = (c.name || c.addresses[0] || "").charAt(0);
+          const letter = /[a-z]/i.test(first) ? first.toUpperCase() : "#";
           const unread = !c.read && !OUTGOING.has(c.type);
           return `<button class="conv${c.thread === U.thread ? " on" : ""}${unread ? " unread" : ""}" data-act="thread" data-id="${c.thread}">
             <span class="avatar" style="background:${hue(c.name)}">${esc(letter)}</span>
@@ -619,6 +652,8 @@ VIEWS.messages = {
             <span class="prev">${OUTGOING.has(c.type) ? "You: " : ""}${esc(c.body.replace(/\s+/g, " "))}</span></span></button>`;
         })
         .join("") || `<p class="empty" style="padding:0 8px">${q ? "No conversations match." : "No conversations synced yet."}</p>`;
+      if (matches.length > LIMIT) list += `<p class="empty" style="padding:4px 8px">Showing the newest ${LIMIT} of ${matches.length}. Search to find older ones.</p>`;
+      if (U.convsError) list = `<p class="empty" style="padding:0 8px 6px">Couldn't refresh: ${esc(U.convsError)}</p>` + list;
     }
     patch($("#convlist"), list);
 
@@ -704,7 +739,8 @@ async function sendMessage() {
   (U.outbox[tid] ||= []).push(text);
   render();
   try {
-    const r = await call("sendMessage", { device: d.id, thread: tid, text });
+    const conv = (U.convs || []).find((c) => c.thread === tid);
+    const r = await call("sendMessage", { device: d.id, thread: tid, text, addresses: conv ? conv.addresses : [] });
     U.outbox[tid] = U.outbox[tid].filter((t) => t !== text);
     (U.msgs[r.thread] ||= {})[r.message.uid] = r.message;
     render();
@@ -721,50 +757,115 @@ async function sendMessage() {
 
 VIEWS.remote = {
   shell: (d) => `${header("Remote input", esc(d.name), "", "overview")}
-    <p class="soft" style="margin:0">Drag inside the pad to move ${esc(d.name)}'s pointer. Tap to click, scroll to scroll.</p>
-    <div class="pad" id="pad" tabindex="0">Drag here</div>
+    <p class="soft" style="margin:0" id="padhelp">Click the pad to take over ${esc(d.name)}'s pointer. Your mouse buttons and wheel then act on the phone; press Esc to let go.</p>
+    <div class="pad" id="pad" tabindex="0">Click to control ${esc(d.name)}</div>
     <div class="clicks"><button class="btn wide" data-act="click" data-kind="singleclick">Left click</button>
     <button class="btn wide" data-act="click" data-kind="middleclick">Middle</button>
     <button class="btn wide" data-act="click" data-kind="rightclick">Right click</button></div>`,
+  // Two modes, like the stock app's touchpad:
+  // - captured: the pad holds the pointer (Pointer Lock), so movement is
+  //   unlimited raw deltas and real mouse buttons click on the phone, with
+  //   holds turned into drags;
+  // - drag: where pointer lock is refused, drag inside the pad to move and
+  //   tap to click.
+  // Moves go out at most once a frame and wheel at most every 40 ms, each as
+  // the sum since the last send, so a fast mouse or a trackpad doesn't queue
+  // up hundreds of packets for the phone to work through.
   mount(d) {
     const pad = $("#pad");
-    let last = null, moved = 0, downAt = 0, acc = [0, 0], raf = 0;
-    const flushMove = () => {
-      raf = 0;
-      const [dx, dy] = acc.map(Math.round);
-      if (dx || dy) {
-        acc = [acc[0] - dx, acc[1] - dy];
-        call("mouseMove", { device: d.id, dx, dy });
-      }
+    const BUTTON = { 0: "singleclick", 1: "middleclick", 2: "rightclick" };
+    let move = [0, 0], moveRaf = 0, wheel = [0, 0], wheelTimer = 0;
+    let drag = null; // fallback mode: {x, y, moved, at}
+    let held = null; // captured mode: {button, at, dragging, timer}
+
+    const send = (body) => call("mouseCommand", { device: d.id, body }).catch(() => {});
+    const queueMove = (dx, dy) => {
+      move[0] += dx;
+      move[1] += dy;
+      if (!moveRaf)
+        moveRaf = requestAnimationFrame(() => {
+          moveRaf = 0;
+          const [x, y] = move.map(Math.trunc);
+          move = [move[0] - x, move[1] - y];
+          if (x || y) call("mouseMove", { device: d.id, dx: x, dy: y }).catch(() => {});
+        });
     };
+    const locked = () => document.pointerLockElement === pad;
+    const setLive = () => {
+      pad.classList.toggle("live", locked());
+      pad.textContent = locked() ? `Controlling ${d.name} · Esc to stop` : `Click to control ${d.name}`;
+    };
+
+    document.onpointerlockchange = setLive;
+    document.onpointerlockerror = () => {
+      pad.dataset.mode = "drag";
+      pad.textContent = "Drag here to move · tap to click";
+      $("#padhelp").textContent = `Drag inside the pad to move ${d.name}'s pointer. Tap to click, scroll to scroll.`;
+    };
+
     pad.addEventListener("pointerdown", (e) => {
-      pad.setPointerCapture(e.pointerId);
-      last = [e.clientX, e.clientY];
-      moved = 0;
-      downAt = Date.now();
-      pad.classList.add("live");
+      if (locked()) {
+        e.preventDefault();
+        // A press held longer than 250 ms becomes a drag (singlehold), so
+        // you can select or move things on the phone.
+        held = { button: e.button, at: Date.now(), dragging: false };
+        if (e.button === 0) held.timer = setTimeout(() => {
+          if (held && !held.dragging) {
+            held.dragging = true;
+            send({ singlehold: true });
+          }
+        }, 250);
+        return;
+      }
+      if (pad.dataset.mode === "drag") {
+        pad.setPointerCapture(e.pointerId);
+        drag = { x: e.clientX, y: e.clientY, moved: 0, at: Date.now() };
+        pad.classList.add("live");
+        return;
+      }
+      pad.requestPointerLock();
     });
+
     pad.addEventListener("pointermove", (e) => {
-      if (!last) return;
-      const dx = (e.clientX - last[0]) * 1.6, dy = (e.clientY - last[1]) * 1.6;
-      last = [e.clientX, e.clientY];
-      moved += Math.abs(dx) + Math.abs(dy);
-      acc[0] += dx;
-      acc[1] += dy;
-      if (!raf) raf = requestAnimationFrame(flushMove);
+      if (locked()) return queueMove(e.movementX, e.movementY);
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      drag.x = e.clientX;
+      drag.y = e.clientY;
+      drag.moved += Math.abs(dx) + Math.abs(dy);
+      queueMove(dx * 1.5, dy * 1.5);
     });
-    const up = (e) => {
-      if (!last) return;
-      last = null;
-      pad.classList.remove("live");
-      if (moved < 6 && Date.now() - downAt < 300) call("mouseCommand", { device: d.id, body: { [e.button === 2 ? "rightclick" : "singleclick"]: true } });
-    };
-    pad.addEventListener("pointerup", up);
-    pad.addEventListener("pointercancel", up);
+
+    pad.addEventListener("pointerup", (e) => {
+      if (locked() && held) {
+        clearTimeout(held.timer);
+        if (held.dragging) send({ singlerelease: true });
+        else if (BUTTON[held.button]) send({ [BUTTON[held.button]]: true });
+        held = null;
+        return;
+      }
+      if (drag) {
+        if (drag.moved < 6 && Date.now() - drag.at < 300) send({ [BUTTON[e.button] || "singleclick"]: true });
+        drag = null;
+        pad.classList.remove("live");
+      }
+    });
+
     pad.addEventListener("contextmenu", (e) => e.preventDefault());
     pad.addEventListener("wheel", (e) => {
       e.preventDefault();
-      call("mouseCommand", { device: d.id, body: { scroll: true, dx: Math.round(-e.deltaX), dy: Math.round(-e.deltaY) } });
+      // Line-mode wheels report ~3 per notch; scale to the 120-per-notch
+      // angle deltas the phone expects, same as the stock app sends.
+      const k = e.deltaMode === 1 ? 40 : 1;
+      wheel[0] -= e.deltaX * k;
+      wheel[1] -= e.deltaY * k;
+      if (!wheelTimer)
+        wheelTimer = setTimeout(() => {
+          wheelTimer = 0;
+          const [dx, dy] = wheel.map(Math.round);
+          wheel = [0, 0];
+          if (dx || dy) send({ scroll: true, dx, dy });
+        }, 40);
     }, { passive: false });
   },
   update() {},
@@ -842,6 +943,7 @@ const ACTIONS = {
   select(el) {
     U.dev = el.dataset.id;
     U.convs = null;
+    U.convsError = null;
     U.thread = null;
     U.msgs = {};
     go("overview");
@@ -869,7 +971,11 @@ const ACTIONS = {
   sendClipboard: () => run("sendClipboard", () => call("sendClipboard", dev()), "Clipboard sent"),
   ping: () => run("ping", () => call("ping", dev()), "Ping sent"),
   ring: () => run("ring", () => call("ring", dev()), "Ringing " + cur().name),
-  browse: () => run("browse", () => call("browse", dev())),
+  browse: () => run("browse", async () => {
+    const r = await call("browse", dev());
+    toast("Opened " + r.path.split("/").slice(-2).join("/"), "ok");
+  }),
+  retryConvs: () => loadConversations(false),
   remote: () => go("remote"),
   messages: () => go("messages", { thread: null }),
   media: (el) => call("media", { ...dev(), action: el.dataset.action }),
@@ -978,7 +1084,9 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     sendMessage();
   } else if (e.target.id === "devname" && e.key === "Enter") ACTIONS.saveName();
-  else if (e.key === "Escape" && !$(".scrim")) {
+  // While the remote pad holds the pointer, Esc only releases it (the
+  // browser does that itself); it must not also navigate away.
+  else if (e.key === "Escape" && !$(".scrim") && !document.pointerLockElement) {
     if (U.mode === "share") call("close");
     else if (U.view === "messages" && U.thread !== null) {
       U.thread = null;

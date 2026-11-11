@@ -59,6 +59,7 @@ class DemoDaemon(Daemon):
         self.contacts = {}
         self.thread_keys = {}
         self.pair_seen = {}
+        self.last_resync = {}
         self.name = "workstation"
         self.providers = [
             {"display": "Bluetooth", "name": "BluetoothLinkProvider", "enabled": True},
@@ -195,7 +196,8 @@ class DemoDaemon(Daemon):
             phone["notifications"] = [n for n in phone["notifications"] if n["id"] != nid]
         self.changed()
         if done:
-            GLib.idle_add(lambda: done(True, None) and False)
+            error = "Demo mode has no phone to browse" if method == "mountAndWait" else None
+            GLib.idle_add(lambda: done(None if error else True, error) and False)
 
     def set_prop(self, path, iface, name, variant):
         m = self.devices["demo_pixel"]["mpris"]
@@ -205,6 +207,9 @@ class DemoDaemon(Daemon):
 
     def name_for(self, dev, addresses):
         return ", ".join(self.contacts.get(dev, {}).get(a, a) for a in addresses)
+
+    def conversations_async(self, dev, done):
+        GLib.idle_add(lambda: done(self.conversations(dev), None) and False)
 
     def conversations(self, dev):
         out = []

@@ -265,6 +265,9 @@ class Daemon:
         self.contacts = {}
         self.thread_keys = {}  # dev -> {address_key: threadId}, from the last listing
         self.pair_seen = {}  # dev -> time a peer pairing request was first seen
+        self.msg_queue = {}  # dev -> [messages] waiting for flush_messages
+        self.msg_flush_id = 0
+        self.last_resync = {}  # dev -> time of the last requestAllConversationThreads
 
         self.bus.signal_subscribe(BUS, None, None, None, None, Gio.DBusSignalFlags.NONE, self.on_signal)
         Gio.bus_watch_name_on_connection(self.bus, BUS, Gio.BusNameWatcherFlags.AUTO_START, self.on_appeared, self.on_vanished)
@@ -549,14 +552,23 @@ class Daemon:
         return {"body": body, "addresses": [a[0] for a in addrs], "date": date, "type": mtype, "read": bool(read), "thread": thread, "uid": uid, "attachments": len(attachments)}
 
     def on_conversation(self, dev, member, params):
+        # A resync makes the phone send thousands of these; queue them and
+        # hand the page one batch every 250 ms instead of one call each.
+        # conversationLoaded carries nothing the page uses, so it is dropped.
         if member in ("conversationCreated", "conversationUpdated"):
             msg = self.message(params.unpack()[0])
             thread = self.threads.setdefault(dev, {}).setdefault(msg["thread"], {})
             thread[msg["uid"]] = msg
-            self.push("message", {"device": dev, "message": msg})
-        elif member == "conversationLoaded":
-            tid, count = params.unpack()
-            self.push("threadLoaded", {"device": dev, "thread": tid, "count": count})
+            self.msg_queue.setdefault(dev, []).append(msg)
+            if not self.msg_flush_id:
+                self.msg_flush_id = GLib.timeout_add(250, self.flush_messages)
+
+    def flush_messages(self):
+        self.msg_flush_id = 0
+        queue, self.msg_queue = self.msg_queue, {}
+        for dev, msgs in queue.items():
+            self.push("messages", {"device": dev, "messages": msgs})
+        return False
 
     def name_for(self, dev, addresses):
         if dev not in self.contacts:
@@ -564,8 +576,20 @@ class Daemon:
         names = [self.contacts[dev].get(digits(a), a) for a in addresses]
         return ", ".join(names)
 
-    def conversations(self, dev):
-        raw = self.call(device_path(dev), "org.kde.kdeconnect.device.conversations", "activeConversations", reply="(av)")
+    def conversations_async(self, dev, done):
+        """Fetch the thread list without blocking the window.
+
+        The reply can be several MB (each thread's latest message carries its
+        attachment thumbnails), and the daemon can be slow to answer while the
+        phone is resyncing, so this must not be a blocking call.
+        """
+
+        def got(raw, error):
+            done(None if error else self.build_conversations(dev, raw), error)
+
+        self.call_async(device_path(dev), "org.kde.kdeconnect.device.conversations", "activeConversations", done=got, timeout=60000)
+
+    def build_conversations(self, dev, raw):
         by_thread = {}
         for v in raw:
             m = self.message(v)
@@ -573,14 +597,20 @@ class Daemon:
             by_thread[m["thread"]] = m
         self.thread_keys[dev] = {address_key(m["addresses"]): t for t, m in by_thread.items()}
         # A locally recorded message newer than a thread's latest becomes its
-        # preview; one to a number with no thread yet becomes its own entry.
+        # preview, keeping the thread's own name and numbers (a reply's record
+        # may have none); one to a number with no thread yet becomes its own
+        # entry.
         for rec in sent_load(dev):
             tid = self.resolve_thread(dev, rec)
             latest = by_thread.get(tid)
-            if latest is None or rec["date"] > latest["date"]:
-                local = self.local_message(dev, rec, tid)
+            local = self.local_message(dev, rec, tid)
+            if latest is None:
+                if not local["addresses"]:
+                    continue  # a reply to a thread the phone no longer lists
                 local["name"] = self.name_for(dev, local["addresses"])
                 by_thread[tid] = local
+            elif rec["date"] > latest["date"]:
+                by_thread[tid] = {**local, "addresses": latest["addresses"], "name": latest["name"]}
         return sorted(by_thread.values(), key=lambda m: -m["date"])
 
     def resolve_thread(self, dev, rec):
@@ -730,16 +760,30 @@ class Bridge:
         return self.dev_call(a, "clipboard", "org.kde.kdeconnect.device.clipboard", "sendClipboard", done=done)
 
     def m_browse(self, a, done):
-        def finished(ok, err):
+        # The daemon's own startBrowsing mounts the phone and then opens a
+        # kdeconnect:// URL through KIO, which does nothing without a KDE file
+        # manager. Mount, then open the mounted folder with whatever handles
+        # directories on this desktop.
+        path = device_path(a["device"]) + "/sftp"
+        iface = "org.kde.kdeconnect.device.sftp"
+
+        def mounted(ok, err):
             if err or not ok:
-                path = device_path(a["device"]) + "/sftp"
                 try:
-                    err = err or self.d.call(path, "org.kde.kdeconnect.device.sftp", "getMountError", reply="(s)") or "Could not mount the device"
+                    err = err or self.d.call(path, iface, "getMountError", reply="(s)") or "Could not mount the device"
                 except GLib.Error as e:
                     err = e.message
-            done(None, err)
+                done(None, err)
+                return
+            try:
+                dirs = self.d.call(path, iface, "getDirectories", reply="(a{sv})")
+                folder = next(iter(dirs), None) or self.d.call(path, iface, "mountPoint", reply="(s)")
+                Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(folder).get_uri(), None)
+                done({"path": folder})
+            except GLib.Error as e:
+                done(None, f"Mounted, but nothing opened the folder: {e.message}")
 
-        self.d.call_async(device_path(a["device"]) + "/sftp", "org.kde.kdeconnect.device.sftp", "startBrowsing", done=finished, timeout=60000)
+        self.d.call_async(path, iface, "mountAndWait", done=mounted, timeout=60000)
         return ASYNC
 
     def m_sendFiles(self, a, done):
@@ -849,13 +893,19 @@ class Bridge:
 
     def m_conversations(self, a, done):
         dev = a["device"]
-        if a.get("request"):
-            self.d.call_async(device_path(dev), "org.kde.kdeconnect.device.conversations", "requestAllConversationThreads")
+        # A full resync makes the phone resend every thread (thousands of
+        # signals, and a busy daemon for tens of seconds), so do it at most
+        # every five minutes rather than every time Messages opens. New
+        # messages arrive as signals in between anyway.
+        if a.get("request") and time.time() - self.d.last_resync.get(dev, 0) > 300:
+            self.d.last_resync[dev] = time.time()
+            self.d.call_async(device_path(dev), "org.kde.kdeconnect.device.conversations", "requestAllConversationThreads", done=lambda r, e: None)
             # Names come from the phone's contacts; ask for a fresh copy. The
             # answer arrives as localCacheSynchronized (see on_signal).
             if self.d.has(dev, "kdeconnect_contacts"):
                 self.d.call_async(device_path(dev) + "/contacts", "org.kde.kdeconnect.device.contacts", "synchronizeRemoteWithLocal", done=lambda r, e: None)
-        return self.d.conversations(dev)
+        self.d.conversations_async(dev, lambda result, error: done(result, error))
+        return ASYNC
 
     def m_thread(self, a, done):
         dev, tid = a["device"], int(a["thread"])
@@ -868,7 +918,9 @@ class Bridge:
         iface = "org.kde.kdeconnect.device.conversations"
         tid = int(a["thread"]) if a.get("thread") is not None else None
         if tid is not None and tid >= 0:
-            addresses = []
+            # Kept with the record so it still names the thread if the phone
+            # later drops the thread from its list.
+            addresses = [x for x in (a.get("addresses") or []) if x]
             method, sig, args = "replyToConversation", "(xsav)", (tid, text, [])
         else:
             addresses = [x.strip() for x in (a.get("addresses") or self.d.thread_addresses(dev, tid)) if x.strip()]
