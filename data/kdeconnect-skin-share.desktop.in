@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Send to phone
+Comment=Send files or a link to a KDE Connect device
+Exec=@BIN@ --share %U
+Icon=kdeconnect
+NoDisplay=true

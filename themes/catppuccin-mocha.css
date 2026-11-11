@@ -1,0 +1,33 @@
+/* Catppuccin Mocha (https://catppuccin.com). The bright accents are Mocha's;
+   the muted set borrows Latte's, which are the same hues, darker. bg0_soft has
+   no Catppuccin name: it sits between base and surface0. */
+:root {
+  --bg0_hard: #181825; /* mantle */
+  --bg0: #1e1e2e;      /* base */
+  --bg0_soft: #262637;
+  --bg1: #313244;      /* surface0 */
+  --bg2: #45475a;      /* surface1 */
+  --bg3: #585b70;      /* surface2 */
+
+  --fg0: #cdd6f4;      /* text */
+  --fg1: #cdd6f4;      /* text */
+  --fg2: #bac2de;      /* subtext1 */
+  --fg3: #a6adc8;      /* subtext0 */
+  --fg4: #9399b2;      /* overlay2 */
+
+  --bright_red: #f38ba8;
+  --bright_green: #a6e3a1;
+  --bright_yellow: #f9e2af;
+  --bright_blue: #89b4fa;
+  --bright_purple: #cba6f7; /* mauve */
+  --bright_aqua: #94e2d5;   /* teal */
+  --bright_orange: #fab387; /* peach */
+
+  --dark_red: #d20f39;
+  --dark_green: #40a02b;
+  --dark_yellow: #df8e1d;
+  --dark_blue: #1e66f5;
+  --dark_purple: #8839ef;
+  --dark_aqua: #179299;
+  --dark_orange: #fe640b;
+}

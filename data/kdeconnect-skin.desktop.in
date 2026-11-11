@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=KDE Connect
+GenericName=Phone integration
+Comment=Pair devices, send files, read messages
+Exec=@BIN@
+Icon=kdeconnect
+Categories=Network;
+Keywords=phone;android;sms;kdeconnect;
+StartupWMClass=io.github.mukheshpugal.KdeconnectSkin
